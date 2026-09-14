@@ -126,6 +126,23 @@ export const createDac = async (req, res) => {
           );
           consumer = created;
           createdConsumer = true;
+        } else if (consumerInput) {
+          let consumerDirty = false;
+          if (!consumer.fatherName?.trim() && consumerInput.fatherName?.trim()) {
+            consumer.fatherName = consumerInput.fatherName.trim();
+            consumerDirty = true;
+          }
+          if (!consumer.phone?.trim() && consumerInput.phone?.trim()) {
+            consumer.phone = consumerInput.phone.trim();
+            consumerDirty = true;
+          }
+          if (!consumer.address?.trim() && consumerInput.address?.trim()) {
+            consumer.address = consumerInput.address.trim();
+            consumerDirty = true;
+          }
+          if (consumerDirty) {
+            await consumer.save({ session });
+          }
         }
 
         const intervalCheck = await assertIntervalElapsed(
