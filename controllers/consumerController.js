@@ -116,6 +116,10 @@ export const createConsumer = async (req, res) => {
   }
 };
 
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 export const listConsumers = async (req, res) => {
   try {
     const filter = ownedFilter(req);
@@ -123,14 +127,41 @@ export const listConsumers = async (req, res) => {
       filter.distributor = req.query.distributor;
     }
 
-    const consumers = await Consumer.find(filter)
-      .populate({
-        path: "distributor",
-        select: "name company",
-      })
-      .sort({ consumerNumber: 1 });
+    const consumerNumber = req.query.consumerNumber?.trim();
+    const phone = req.query.phone?.trim();
+    const name = req.query.name?.trim();
 
-    res.json(consumers);
+    if (consumerNumber) {
+      filter.consumerNumber = {
+        $regex: escapeRegex(consumerNumber),
+        $options: "i",
+      };
+    }
+    if (phone) {
+      filter.phone = { $regex: escapeRegex(phone), $options: "i" };
+    }
+    if (name) {
+      filter.name = { $regex: escapeRegex(name), $options: "i" };
+    }
+
+    const page = Math.max(1, Number.parseInt(String(req.query.page || "1"), 10) || 1);
+    const requestedLimit = Number.parseInt(String(req.query.limit || "50"), 10) || 50;
+    const limit = Math.min(Math.max(requestedLimit, 1), 5000);
+    const skip = (page - 1) * limit;
+
+    const [items, total] = await Promise.all([
+      Consumer.find(filter)
+        .populate({
+          path: "distributor",
+          select: "name company",
+        })
+        .sort({ consumerNumber: 1 })
+        .skip(skip)
+        .limit(limit),
+      Consumer.countDocuments(filter),
+    ]);
+
+    res.json({ items, total, page, limit });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
