@@ -7,6 +7,7 @@ import consumerRoutes from "./routes/consumerRoutes.js";
 import dacRoutes from "./routes/dacRoutes.js";
 import purchaseRoutes from "./routes/purchaseRoutes.js";
 import itemRoutes from "./routes/itemRoutes.js";
+import trashRoutes from "./routes/trashRoutes.js";
 import userRoutes from "./routes/userRoutes.js";
 
 export function createApp() {
@@ -27,6 +28,7 @@ export function createApp() {
   app.use("/api/dacs", dacRoutes);
   app.use("/api/purchases", purchaseRoutes);
   app.use("/api/items", itemRoutes);
+  app.use("/api/trash", trashRoutes);
 
   return app;
 }

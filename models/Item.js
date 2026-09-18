@@ -17,9 +17,11 @@ const itemSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+// `isDeleted: false` and not `$ne: true`: partial filters reject `$ne`, which
+// makes the whole index silently fail to build.
 itemSchema.index(
   { owner: 1, name: 1 },
-  { unique: true, partialFilterExpression: { isDeleted: { $ne: true } } }
+  { unique: true, partialFilterExpression: { isDeleted: false } }
 );
 
 const Item = mongoose.model("Item", itemSchema);
