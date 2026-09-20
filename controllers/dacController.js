@@ -212,6 +212,10 @@ export const createDac = async (req, res) => {
   }
 };
 
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 export const listDacs = async (req, res) => {
   try {
     const filter = ownedFilter(req);
@@ -224,17 +228,33 @@ export const listDacs = async (req, res) => {
       filter.consumer = req.query.consumer;
     }
 
-    if (req.query.consumerNumber && req.query.distributor) {
-      const consumer = await Consumer.findOne(
-        ownedFilter(req, {
-          distributor: req.query.distributor,
-          consumerNumber: String(req.query.consumerNumber).trim(),
-        })
-      );
-      if (!consumer) {
+    const consumerNumber = String(req.query.consumerNumber || "").trim();
+    const consumerName = String(req.query.consumerName || "").trim();
+    const consumerDistributor = String(req.query.consumerDistributor || "").trim();
+
+    if (!filter.consumer && (consumerNumber || consumerName || consumerDistributor)) {
+      const consumerFilter = { owner: ownerId(req) };
+      if (consumerDistributor) {
+        consumerFilter.distributor = consumerDistributor;
+      }
+      if (consumerNumber) {
+        consumerFilter.consumerNumber = {
+          $regex: escapeRegex(consumerNumber),
+          $options: "i",
+        };
+      }
+      if (consumerName) {
+        consumerFilter.name = {
+          $regex: escapeRegex(consumerName),
+          $options: "i",
+        };
+      }
+
+      const consumers = await Consumer.find(consumerFilter).select("_id");
+      if (!consumers.length) {
         return res.json([]);
       }
-      filter.consumer = consumer._id;
+      filter.consumer = { $in: consumers.map((row) => row._id) };
     }
 
     const range = buildDateRangeFilter(req.query.from, req.query.to, "dacDate");
@@ -299,6 +319,31 @@ export const updateDac = async (req, res) => {
     }
 
     const updates = {};
+    let targetConsumerId = dac.consumer;
+
+    if (req.body.consumerId) {
+      const nextId = String(req.body.consumerId);
+      if (nextId !== String(dac.consumer)) {
+        const consumer = await Consumer.findOne(
+          ownedFilter(req, { _id: nextId })
+        );
+        if (!consumer) {
+          return res.status(404).json({ message: "Consumer not found" });
+        }
+        updates.consumer = consumer._id;
+        targetConsumerId = consumer._id;
+      } else {
+        const currentConsumer = await Consumer.findOne({
+          owner: ownerId(req),
+          _id: nextId,
+        });
+        if (currentConsumer?.isDeleted) {
+          return res.status(400).json({
+            message: "This consumer has been deleted. Select another consumer.",
+          });
+        }
+      }
+    }
 
     if (req.body.dacNumber !== undefined) {
       if (!req.body.dacNumber?.trim()) {
@@ -312,11 +357,14 @@ export const updateDac = async (req, res) => {
       if (Number.isNaN(parsedDate.getTime())) {
         return res.status(400).json({ message: "Invalid dacDate" });
       }
+      updates.dacDate = parsedDate;
+    }
 
+    if (updates.consumer || updates.dacDate !== undefined) {
       const intervalCheck = await assertIntervalElapsed(
         ownerId(req),
-        dac.consumer,
-        parsedDate,
+        targetConsumerId,
+        updates.dacDate || dac.dacDate,
         dac._id
       );
       if (!intervalCheck.ok) {
@@ -326,8 +374,6 @@ export const updateDac = async (req, res) => {
           nextEligibleDate: intervalCheck.nextEligibleDate,
         });
       }
-
-      updates.dacDate = parsedDate;
     }
 
     if (req.body.amount !== undefined) {

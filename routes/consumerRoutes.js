@@ -3,6 +3,7 @@ import {
   createConsumer,
   deleteConsumer,
   getConsumer,
+  importConsumers,
   listConsumers,
   lookupConsumer,
   updateConsumer,
@@ -14,6 +15,7 @@ const router = Router();
 router.use(protect);
 
 router.get("/lookup", lookupConsumer);
+router.post("/import", importConsumers);
 router.post("/", createConsumer);
 router.get("/", listConsumers);
 router.get("/:id", getConsumer);

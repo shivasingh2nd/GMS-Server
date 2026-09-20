@@ -29,11 +29,25 @@ export const lookupConsumer = async (req, res) => {
     );
 
     if (!consumer) {
+      const otherMatches = (
+        await Consumer.find(
+          ownedFilter(req, {
+            consumerNumber: consumerNumber.trim(),
+            distributor: { $ne: distributorId },
+          })
+        ).populate({
+          path: "distributor",
+          select: "name company",
+          match: { isDeleted: { $ne: true } },
+        })
+      ).filter((row) => row.distributor);
+
       return res.json({
         found: false,
         consumer: null,
         lastDac: null,
         nextEligibleDate: null,
+        otherMatches,
       });
     }
 
@@ -53,6 +67,7 @@ export const lookupConsumer = async (req, res) => {
       consumer,
       lastDac,
       nextEligibleDate,
+      otherMatches: [],
     });
   } catch (err) {
     res.status(500).json({ message: err.message });
@@ -116,6 +131,124 @@ export const createConsumer = async (req, res) => {
   }
 };
 
+export const IMPORT_ROW_LIMIT = 700;
+
+function trimmed(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+export const importConsumers = async (req, res) => {
+  try {
+    const { distributor: distributorId, consumers } = req.body;
+
+    if (!distributorId) {
+      return res.status(400).json({ message: "Distributor is required" });
+    }
+    if (!Array.isArray(consumers) || !consumers.length) {
+      return res.status(400).json({ message: "No consumers to import" });
+    }
+    if (consumers.length > IMPORT_ROW_LIMIT) {
+      return res.status(400).json({
+        message: `Import at most ${IMPORT_ROW_LIMIT} consumers at a time`,
+      });
+    }
+
+    const distributor = await Distributor.findOne(
+      ownedFilter(req, { _id: distributorId })
+    );
+    if (!distributor) {
+      return res.status(404).json({ message: "Distributor not found" });
+    }
+
+    const existing = await Consumer.find(
+      ownedFilter(req, { distributor: distributorId })
+    )
+      .select("consumerNumber")
+      .lean();
+    const takenNumbers = new Set(
+      existing.map((row) => String(row.consumerNumber).toUpperCase())
+    );
+
+    const seenInPayload = new Set();
+    const docs = [];
+    const created = [];
+    const skipped = [];
+    const failed = [];
+
+    for (const row of consumers) {
+      const consumerNumber = trimmed(row?.consumerNumber);
+      const name = trimmed(row?.name);
+
+      if (!consumerNumber || !name) {
+        failed.push({
+          consumerNumber,
+          reason: "Consumer number and name are required",
+        });
+        continue;
+      }
+
+      const key = consumerNumber.toUpperCase();
+
+      if (seenInPayload.has(key)) {
+        skipped.push({ consumerNumber, reason: "Duplicate row in file" });
+        continue;
+      }
+      if (takenNumbers.has(key)) {
+        skipped.push({ consumerNumber, reason: "Already exists" });
+        continue;
+      }
+
+      seenInPayload.add(key);
+      docs.push({
+        owner: ownerId(req),
+        distributor: distributorId,
+        consumerNumber,
+        name,
+        fatherName: trimmed(row?.fatherName) || undefined,
+        phone: trimmed(row?.phone) || undefined,
+        address: trimmed(row?.address) || undefined,
+      });
+    }
+
+    if (docs.length) {
+      try {
+        const inserted = await Consumer.insertMany(docs, { ordered: false });
+        created.push(...inserted.map((doc) => doc.consumerNumber));
+      } catch (err) {
+        const writeErrors = err.writeErrors || err.result?.result?.writeErrors || [];
+        if (!writeErrors.length) throw err;
+
+        const failedIndexes = new Set();
+        for (const writeError of writeErrors) {
+          const index = writeError.index ?? writeError.err?.index;
+          failedIndexes.add(index);
+          const doc = docs[index];
+          const code = writeError.code ?? writeError.err?.code;
+          if (code === 11000) {
+            skipped.push({
+              consumerNumber: doc?.consumerNumber,
+              reason: "Already exists",
+            });
+          } else {
+            failed.push({
+              consumerNumber: doc?.consumerNumber,
+              reason: writeError.errmsg || "Could not be saved",
+            });
+          }
+        }
+
+        docs.forEach((doc, index) => {
+          if (!failedIndexes.has(index)) created.push(doc.consumerNumber);
+        });
+      }
+    }
+
+    res.status(201).json({ created, skipped, failed });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
 function escapeRegex(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -123,15 +256,51 @@ function escapeRegex(value) {
 export const listConsumers = async (req, res) => {
   try {
     const filter = ownedFilter(req);
-    if (req.query.distributor) {
+    const duplicatesOnly =
+      req.query.duplicates === "true" || req.query.duplicates === "1";
+
+    if (!duplicatesOnly && req.query.distributor) {
       filter.distributor = req.query.distributor;
     }
 
     const consumerNumber = req.query.consumerNumber?.trim();
-    const phone = req.query.phone?.trim();
-    const name = req.query.name?.trim();
+    const phone = duplicatesOnly ? "" : req.query.phone?.trim();
+    const name = duplicatesOnly ? "" : req.query.name?.trim();
 
-    if (consumerNumber) {
+    const duplicateCountByNumber = {};
+
+    if (duplicatesOnly) {
+      const duplicateNumbers = await Consumer.aggregate([
+        { $match: ownedFilter(req) },
+        {
+          $group: {
+            _id: { $toUpper: "$consumerNumber" },
+            count: { $sum: 1 },
+            values: { $addToSet: "$consumerNumber" },
+          },
+        },
+        { $match: { count: { $gt: 1 } } },
+      ]);
+
+      let groups = duplicateNumbers;
+      if (consumerNumber) {
+        const needle = consumerNumber.toUpperCase();
+        groups = groups.filter((row) => String(row._id).includes(needle));
+      }
+
+      for (const group of groups) {
+        duplicateCountByNumber[group._id] = group.count;
+      }
+
+      const values = groups.flatMap((row) => row.values);
+      if (!values.length) {
+        const page = Math.max(1, Number.parseInt(String(req.query.page || "1"), 10) || 1);
+        const requestedLimit = Number.parseInt(String(req.query.limit || "50"), 10) || 50;
+        const limit = Math.min(Math.max(requestedLimit, 1), 5000);
+        return res.json({ items: [], total: 0, page, limit });
+      }
+      filter.consumerNumber = { $in: values };
+    } else if (consumerNumber) {
       filter.consumerNumber = {
         $regex: escapeRegex(consumerNumber),
         $options: "i",
@@ -149,17 +318,26 @@ export const listConsumers = async (req, res) => {
     const limit = Math.min(Math.max(requestedLimit, 1), 5000);
     const skip = (page - 1) * limit;
 
-    const [items, total] = await Promise.all([
+    const [docs, total] = await Promise.all([
       Consumer.find(filter)
         .populate({
           path: "distributor",
           select: "name company",
         })
-        .sort({ consumerNumber: 1 })
+        .sort({ consumerNumber: 1, name: 1 })
         .skip(skip)
         .limit(limit),
       Consumer.countDocuments(filter),
     ]);
+
+    const items = docs.map((row) => {
+      const json = row.toJSON();
+      if (duplicatesOnly) {
+        json.duplicateCount =
+          duplicateCountByNumber[String(row.consumerNumber).toUpperCase()] || 0;
+      }
+      return json;
+    });
 
     res.json({ items, total, page, limit });
   } catch (err) {
